@@ -1,0 +1,161 @@
+-- 04b_marts.sql
+USE ROLE SYSADMIN;
+USE WAREHOUSE wh_etl;
+USE SCHEMA olist_dw.marts;
+
+CREATE OR REPLACE TABLE dim_date AS
+WITH d AS (
+  SELECT DATEADD(day, ROW_NUMBER() OVER (ORDER BY SEQ4()) - 1, '2016-01-01'::DATE) AS full_date
+  FROM TABLE(GENERATOR(ROWCOUNT => 1096))
+)
+SELECT TO_NUMBER(TO_VARCHAR(full_date, 'YYYYMMDD')) AS date_key,
+       full_date,
+       YEAR(full_date)           AS year,
+       QUARTER(full_date)        AS quarter,
+       MONTH(full_date)          AS month,
+       MONTHNAME(full_date)      AS month_name,
+       WEEKISO(full_date)        AS iso_week,
+       DAYOFWEEKISO(full_date)   AS day_of_week,
+       DAYNAME(full_date)        AS day_name,
+       DAYOFWEEKISO(full_date) >= 6 AS is_weekend
+FROM d;
+
+CREATE OR REPLACE TABLE dim_customer AS
+SELECT c.customer_id, c.customer_unique_id, c.zip_prefix, c.city, c.state, g.lat, g.lng
+FROM olist_dw.staging.customers c
+LEFT JOIN olist_dw.staging.geolocation_zip g ON c.zip_prefix = g.zip_prefix;
+
+CREATE OR REPLACE TABLE dim_seller AS
+SELECT s.seller_id, s.zip_prefix, s.city, s.state, g.lat, g.lng
+FROM olist_dw.staging.sellers s
+LEFT JOIN olist_dw.staging.geolocation_zip g ON s.zip_prefix = g.zip_prefix;
+
+-- SCD2 product dimension
+CREATE TABLE IF NOT EXISTS dim_product (
+  product_key  NUMBER AUTOINCREMENT START 1 INCREMENT 1,
+  product_id   VARCHAR,
+  category_pt  VARCHAR,
+  category_en  VARCHAR,
+  photos_qty   INT,
+  weight_g     INT,
+  length_cm    INT,
+  height_cm    INT,
+  width_cm     INT,
+  row_hash     NUMBER,
+  valid_from   TIMESTAMP_NTZ,
+  valid_to     TIMESTAMP_NTZ,
+  is_current   BOOLEAN
+);
+
+CREATE OR REPLACE PROCEDURE sp_load_dim_product()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+DECLARE
+  closed INT;
+  opened INT;
+BEGIN
+  -- 1. Close current rows whose attributes changed
+  UPDATE olist_dw.marts.dim_product d
+     SET valid_to = CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, is_current = FALSE
+    FROM (SELECT product_id,
+                 HASH(category_pt, category_en, photos_qty, weight_g,
+                      length_cm, height_cm, width_cm) AS h
+          FROM olist_dw.staging.products) s
+   WHERE d.product_id = s.product_id
+     AND d.is_current
+     AND d.row_hash <> s.h;
+  closed := SQLROWCOUNT;
+
+  -- 2. Insert a current row for new or changed products
+  INSERT INTO olist_dw.marts.dim_product
+    (product_id, category_pt, category_en, photos_qty, weight_g,
+     length_cm, height_cm, width_cm, row_hash, valid_from, valid_to, is_current)
+  SELECT s.product_id, s.category_pt, s.category_en, s.photos_qty, s.weight_g,
+         s.length_cm, s.height_cm, s.width_cm, s.h,
+         IFF(ever.product_id IS NULL,
+             '1900-01-01'::TIMESTAMP_NTZ,
+             CURRENT_TIMESTAMP()::TIMESTAMP_NTZ),
+         '9999-12-31'::TIMESTAMP_NTZ,
+         TRUE
+  FROM (SELECT p.*,
+               HASH(p.category_pt, p.category_en, p.photos_qty, p.weight_g,
+                    p.length_cm, p.height_cm, p.width_cm) AS h
+        FROM olist_dw.staging.products p) s
+  LEFT JOIN (SELECT DISTINCT product_id FROM olist_dw.marts.dim_product) ever
+         ON ever.product_id = s.product_id
+  LEFT JOIN olist_dw.marts.dim_product cur
+         ON cur.product_id = s.product_id AND cur.is_current
+  WHERE cur.product_id IS NULL;
+  opened := SQLROWCOUNT;
+
+  RETURN 'closed ' || TO_VARCHAR(closed) || ', inserted ' || TO_VARCHAR(opened);
+END;
+$$;
+
+CALL sp_load_dim_product();
+
+-- Facts
+CREATE OR REPLACE TABLE fact_order_items AS
+WITH rev AS (
+  SELECT order_id, AVG(review_score) AS review_score
+  FROM olist_dw.staging.order_reviews
+  GROUP BY order_id
+)
+SELECT i.order_id,
+       i.item_seq,
+       TO_NUMBER(TO_VARCHAR(o.purchased_at::DATE, 'YYYYMMDD')) AS order_date_key,
+       o.customer_id,
+       i.seller_id,
+       p.product_key,
+       i.product_id,
+       o.order_status,
+       o.purchased_at,
+       o.delivered_at,
+       o.estimated_delivery_at,
+       i.price,
+       i.freight_value,
+       i.price + i.freight_value                               AS item_total,
+       DATEDIFF(day, o.purchased_at, o.delivered_at)           AS delivery_days,
+       o.delivered_at > o.estimated_delivery_at                AS is_late,
+       r.review_score
+FROM olist_dw.staging.order_items i
+JOIN olist_dw.staging.orders o ON o.order_id = i.order_id
+LEFT JOIN dim_product p
+       ON p.product_id = i.product_id
+      AND o.purchased_at >= p.valid_from
+      AND o.purchased_at <  p.valid_to
+LEFT JOIN rev r ON r.order_id = i.order_id;
+
+CREATE OR REPLACE TABLE fact_payments AS
+SELECT p.order_id,
+       p.payment_seq,
+       TO_NUMBER(TO_VARCHAR(o.purchased_at::DATE, 'YYYYMMDD')) AS order_date_key,
+       o.customer_id,
+       p.payment_type,
+       p.installments,
+       p.payment_value
+FROM olist_dw.staging.order_payments p
+JOIN olist_dw.staging.orders o ON o.order_id = p.order_id;
+
+-- Verify
+SELECT 'dim_product current rows' AS check_name,
+       (SELECT COUNT(*) FROM dim_product WHERE is_current) AS n,
+       (SELECT COUNT(*) FROM olist_dw.staging.products)    AS expected
+UNION ALL SELECT 'fact_order_items rows',
+       (SELECT COUNT(*) FROM fact_order_items),
+       (SELECT COUNT(*) FROM olist_dw.staging.order_items)
+UNION ALL SELECT 'fact_payments rows',
+       (SELECT COUNT(*) FROM fact_payments),
+       (SELECT COUNT(*) FROM olist_dw.staging.order_payments)
+UNION ALL SELECT 'fact rows with no product_key',
+       (SELECT COUNT(*) FROM fact_order_items WHERE product_key IS NULL),
+       0;
+
+-- Business sanity check
+SELECT d.year, COUNT(DISTINCT f.order_id) AS orders, ROUND(SUM(f.price), 0) AS revenue
+FROM fact_order_items f
+JOIN dim_date d ON d.date_key = f.order_date_key
+GROUP BY d.year
+ORDER BY d.year;
