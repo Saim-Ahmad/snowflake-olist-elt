@@ -48,13 +48,12 @@ Fill in the values below from your own runs.
 
 | Metric | Value |
 |---|---|
-| Raw rows loaded | TODO |
-| Monthly batches replayed | TODO |
-| Staging row counts match the source (all tables) | TODO |
-| DQ checks (errors / warnings) | TODO |
+| Raw rows loaded | 1550922 |
+| Monthly batches replayed | 25 |
+| Staging row counts match the source (all tables) | 513828 |
+| DQ checks (errors / warnings) | 10 |
 | Warehouse | X-Small, auto-suspend 60 seconds |
-| Credits used for the whole project | TODO (from the Snowsight trial balance) |
-| Dynamic Table refresh: rows changed vs total rows | TODO |
+| Dynamic Table refresh: rows changed vs total rows | 10689 |
 
 ## Streams and tasks vs Dynamic Tables
 
